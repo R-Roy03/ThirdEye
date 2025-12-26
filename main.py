@@ -23,7 +23,7 @@ if not api_key:
     print("⚠️ WARNING: Google API Key nahi mili!")
 
 genai.configure(api_key=api_key)
-model = genai.GenerativeModel('gemini-1.5-flash')
+model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
 app = FastAPI()
 
