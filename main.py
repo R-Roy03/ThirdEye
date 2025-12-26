@@ -15,7 +15,6 @@ from dotenv import load_dotenv
 load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
 
-# Check API Key
 if not api_key:
     print("❌ API Key missing! Check .env file.")
 else:
@@ -26,7 +25,13 @@ model = genai.GenerativeModel('gemini-flash-latest')
 
 app = FastAPI()
 
-# --- 2. CLOUD STORAGE SETUP ---
+# --- 2. UPTIME ROBOT FIX (HEAD Request) ---
+# Ye naya hissa hai jo UptimeRobot ko "OK" bolega
+@app.head("/")
+async def keep_alive():
+    return Response(status_code=200)
+
+# --- 3. CLOUD STORAGE SETUP ---
 BASE_DIR = Path("/tmp")
 IMAGES_DIR = BASE_DIR / "images"
 AUDIO_DIR = BASE_DIR / "audios"
@@ -40,7 +45,7 @@ for folder in [IMAGES_DIR, AUDIO_DIR, DOCS_DIR]:
 # Mount folders for Twilio access
 app.mount("/audios", StaticFiles(directory=str(AUDIO_DIR)), name="audios")
 
-# --- 3. DATABASE (Long Term Memory) ---
+# --- 4. DATABASE (Long Term Memory) ---
 def init_db():
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
@@ -51,15 +56,15 @@ def init_db():
 
 init_db()
 
-# --- 4. RAM MEMORY (Short Term) ---
-pending_names = {}  # Photo bhejne ke baad naam puchne ke liye
-pdf_context = {}    # PDF ka data yaad rakhne ke liye
+# --- 5. RAM MEMORY (Short Term) ---
+pending_names = {}  
+pdf_context = {}    
 
-# --- 5. HELPER FUNCTION ---
+# --- 6. HELPER FUNCTION ---
 def clean_text_for_audio(text):
     return text.replace('*', '').replace('#', '').replace('_', '').replace('-', ' ')
 
-# --- 6. MAIN LOGIC ---
+# --- 7. MAIN LOGIC ---
 @app.get("/")
 async def root():
     return {"status": "Puch AI Final Version Live", "db": str(DB_PATH)}
@@ -71,7 +76,6 @@ async def whatsapp_reply(request: Request):
     msg_body = form.get('Body', '').strip()
     sender_id = form.get('From')
     
-    # Cloud URL for media
     host_url = str(request.base_url).replace("http://", "https://")
     resp = MessagingResponse()
 
@@ -86,7 +90,6 @@ async def whatsapp_reply(request: Request):
                 print("📸 Image processing...")
                 img_data = requests.get(media_url).content
                 
-                # Loose Safety Settings for Human Recognition
                 safety_settings = [
                     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -95,14 +98,10 @@ async def whatsapp_reply(request: Request):
                 ]
                 
                 image_part = {"mime_type": content_type, "data": img_data}
-                
-                # Prompt: Language neutral description
                 prompt = "Describe this image in detail. Focus on people, faces, objects. Keep it factual."
                 ai_response = model.generate_content([prompt, image_part], safety_settings=safety_settings)
                 
-                # Save description to RAM to ask for name
                 pending_names[sender_id] = ai_response.text
-                
                 resp.message("👁️ Maine dekh liya. Isse kis naam se save karu? (Naam likh kar bhejein)")
 
             # 2. PDF 📄
@@ -119,7 +118,6 @@ async def whatsapp_reply(request: Request):
                 for page in reader.pages:
                     text_content += page.extract_text() + "\n"
                 
-                # Memory mein save karo
                 pdf_context[sender_id] = text_content
                 resp.message(f"✅ PDF Received! Maine {len(reader.pages)} pages padh liye hain. Puchiye kya puchna hai?")
 
@@ -129,17 +127,12 @@ async def whatsapp_reply(request: Request):
                 audio_data = requests.get(media_url).content
                 audio_part = {"mime_type": content_type, "data": audio_data}
                 
-                # Prompt: Language Adaptation
                 prompt = "Listen to the audio. Reply in the EXACT SAME LANGUAGE and TONE as the speaker (Hindi, English, or Hinglish)."
-                
                 ai_response = model.generate_content([prompt, audio_part])
                 bot_text = ai_response.text
                 
-                # Send Text First
                 resp.message(f"🗣️ {bot_text}")
                 
-                # Send Audio (TTS)
-                # Note: 'hi' handles Hindi & Hinglish well. English will have an Indian accent.
                 clean_text = clean_text_for_audio(bot_text)
                 tts = gTTS(text=clean_text, lang='hi') 
                 audio_fn = f"reply_{datetime.now().strftime('%H%M%S')}.mp3"
@@ -170,44 +163,24 @@ async def whatsapp_reply(request: Request):
             # 2. PDF Q&A LOGIC
             elif sender_id in pdf_context:
                 context = pdf_context[sender_id]
-                # Language Prompt
-                prompt = f"""
-                Document Context: {context}
-                
-                User Question: {msg_body}
-                
-                INSTRUCTION: Answer based ONLY on the document. 
-                IMPORTANT: Reply in the SAME LANGUAGE as the User Question (Hindi, English, or Hinglish).
-                """
+                prompt = f"Document Context: {context}\nUser Question: {msg_body}\nINSTRUCTION: Answer based ONLY on the document in the SAME LANGUAGE as the User Question."
                 ai_response = model.generate_content(prompt)
                 resp.message(ai_response.text)
 
             # 3. NORMAL CHAT + MEMORY LOGIC
             else:
-                # DB se purani memories nikalo
                 conn = sqlite3.connect(str(DB_PATH))
                 c = conn.cursor()
                 c.execute("SELECT name_tag, description FROM photos WHERE user_id=? ORDER BY rowid DESC LIMIT 5", (sender_id,))
                 rows = c.fetchall()
                 conn.close()
                 
-                memory_text = "My Visual Memories (What I have seen before):\n"
+                memory_text = "My Visual Memories:\n"
                 if rows:
                     for r in rows:
                         memory_text += f"- Name: {r[0]}, Appearance: {r[1]}\n"
                 
-                # Language Adaptive Prompt
-                prompt = f"""
-                {memory_text}
-                
-                User Message: {msg_body}
-                
-                INSTRUCTION: 
-                1. If the user asks "Who is this?" or refers to a photo, use 'My Visual Memories'.
-                2. If it's a general chat, reply normally.
-                3. IMPORTANT: Reply in the EXACT SAME LANGUAGE as the User Message (Hindi, English, or Hinglish).
-                """
-                
+                prompt = f"{memory_text}\nUser Message: {msg_body}\nINSTRUCTION: Reply in the EXACT SAME LANGUAGE as the User Message (Hindi, English, or Hinglish). If asked about a person, use Visual Memories."
                 ai_response = model.generate_content(prompt)
                 resp.message(ai_response.text)
 
