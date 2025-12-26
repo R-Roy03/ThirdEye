@@ -10,6 +10,7 @@ from gtts import gTTS
 from pypdf import PdfReader
 from dotenv import load_dotenv
 from pymongo import MongoClient
+from duckduckgo_search import DDGS # New Internet Tool
 
 # --- 1. SETUP & CONFIGURATION ---
 load_dotenv()
@@ -18,69 +19,71 @@ mongo_uri = os.getenv("MONGO_URI")
 
 # API Key Check
 if not api_key:
-    print("❌ Google API Key missing! Check Environment Variables.")
+    print("❌ Google API Key missing!")
 
-# Gemini Setup
 genai.configure(api_key=api_key)
 model = genai.GenerativeModel('gemini-flash-latest')
 
 app = FastAPI()
 
 # --- 2. CLOUD DATABASE CONNECTION (With SSL Fix) ---
-photos_collection = None # Safety Lock (Bot crash nahi hone dega)
+photos_collection = None 
 
 if mongo_uri:
     try:
-        # 👇 YE HAI MAGIC LINE (SSL Fix)
-        # Hum bol rahe hain: "Certificate invalid bhi ho toh chalega, bas connect ho ja."
+        # SSL Fix applied here
         client = MongoClient(mongo_uri, tls=True, tlsAllowInvalidCertificates=True)
-        
         db = client.thirdeye_db
         photos_collection = db.photos
-        
-        # Connection Test
         client.admin.command('ping')
         print("✅ Connected to MongoDB Cloud! (SSL Fix Applied)")
     except Exception as e:
         print(f"❌ MongoDB Connection Failed: {e}")
-        print("⚠️ Bot is running in 'Safe Mode' (No Memory).")
+        print("⚠️ Bot running in Safe Mode.")
 else:
-    print("⚠️ MONGO_URI missing in Environment Variables.")
+    print("⚠️ MONGO_URI missing.")
 
-# --- 3. TEMPORARY FILE STORAGE ---
+# --- 3. FILES SETUP ---
 BASE_DIR = Path("/tmp")
 AUDIO_DIR = BASE_DIR / "audios"
 DOCS_DIR = BASE_DIR / "documents"
 
-# Folders banao
 for folder in [AUDIO_DIR, DOCS_DIR]:
     folder.mkdir(parents=True, exist_ok=True)
 
-# Audio access ke liye link
 app.mount("/audios", StaticFiles(directory=str(AUDIO_DIR)), name="audios")
 
-# --- 4. SHORT TERM MEMORY (RAM) ---
-pending_names = {}  # Photo bhejne ke baad naam puchne ke liye
-pdf_context = {}    # PDF padhne ke baad sawal puchne ke liye
+# --- 4. MEMORY ---
+pending_names = {}
+pdf_context = {}
 
-# --- 5. HELPER FUNCTION ---
+# --- 5. HELPER FUNCTIONS ---
 def clean_text_for_audio(text):
-    # Audio mein * ya # na bole, isliye safayi
     return text.replace('*', '').replace('#', '').replace('_', '').replace('-', ' ')
 
-# --- 6. UPTIME ROBOT FIX ---
+def google_search(query):
+    """Internet par search karne ka function"""
+    try:
+        print(f"🌍 Searching for: {query}")
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=3))
+            if results:
+                summary = "\n".join([f"- {r['title']}: {r['body']}" for r in results])
+                return summary
+    except Exception as e:
+        print(f"Search Error: {e}")
+    return None
+
+# --- 6. UPTIME FIX ---
 @app.head("/")
 async def keep_alive():
-    # UptimeRobot ko '200 OK' bolega taaki bot sowe na
     return Response(status_code=200)
 
 @app.get("/")
 async def root():
-    # Browser par status dikhayega
-    db_status = "Connected ✅" if photos_collection is not None else "Disconnected ❌"
-    return {"status": "Puch AI Live", "database": db_status}
+    return {"status": "Puch AI (Internet Enabled) Live 🌍"}
 
-# --- 7. MAIN WHATSAPP LOGIC ---
+# --- 7. MAIN LOGIC ---
 @app.post("/whatsapp")
 async def whatsapp_reply(request: Request):
     form = await request.form()
@@ -88,127 +91,104 @@ async def whatsapp_reply(request: Request):
     msg_body = form.get('Body', '').strip()
     sender_id = form.get('From')
     
-    # Public URL for Audio files
     host_url = str(request.base_url).replace("http://", "https://")
     resp = MessagingResponse()
 
     try:
-        # === A. MEDIA HANDLING (Photo/Audio/PDF) ===
+        # === A. MEDIA HANDLING ===
         if num_media > 0:
             media_url = form.get('MediaUrl0')
             content_type = form.get('MediaContentType0')
             
-            # 1. IMAGE 📸 (Vision)
+            # 1. IMAGE 📸
             if 'image' in content_type:
                 img_data = requests.get(media_url).content
-                
-                # Safety Filters (Taaki bot mana na kare)
-                safety_settings = [
-                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-                ]
-                
                 image_part = {"mime_type": content_type, "data": img_data}
-                prompt = "Describe this image in detail. Focus on people (appearance), objects, and text. Keep it factual."
-                ai_response = model.generate_content([prompt, image_part], safety_settings=safety_settings)
-                
-                # Description ko RAM mein save karo, user se naam pucho
+                prompt = "Describe this image in detail."
+                ai_response = model.generate_content([prompt, image_part])
                 pending_names[sender_id] = ai_response.text
-                resp.message("👁️ Maine dekh liya. Isse kis naam se save karu? (Naam likh kar bhejein)")
+                resp.message("👁️ Maine dekh liya. Naam bataiye save karne ke liye?")
 
-            # 2. PDF 📄 (Document Reader)
+            # 2. PDF 📄
             elif 'application/pdf' in content_type:
                 pdf_data = requests.get(media_url).content
-                pdf_path = DOCS_DIR / f"doc_{sender_id[-4:]}_{datetime.now().strftime('%S')}.pdf"
-                
+                pdf_path = DOCS_DIR / f"doc_{sender_id[-4:]}.pdf"
                 with open(pdf_path, "wb") as f:
                     f.write(pdf_data)
-                
-                # PDF Padhna
                 reader = PdfReader(pdf_path)
                 text_content = ""
                 for page in reader.pages:
                     text_content += page.extract_text() + "\n"
-                
-                # Text ko RAM mein save karo
                 pdf_context[sender_id] = text_content
-                resp.message(f"✅ PDF Received! Maine {len(reader.pages)} pages padh liye hain. Ab isme se kuch bhi puchiye.")
+                resp.message(f"✅ PDF Read! {len(reader.pages)} pages.")
 
-            # 3. AUDIO 🎙️ (Voice Mode)
+            # 3. AUDIO 🎙️
             elif 'audio' in content_type:
                 audio_data = requests.get(media_url).content
                 audio_part = {"mime_type": content_type, "data": audio_data}
-                
-                # Audio Sunna aur Jawab Sochna
-                prompt = "Listen to the audio. Reply in the EXACT SAME LANGUAGE and TONE as the speaker."
+                prompt = "Reply in same language/tone."
                 ai_response = model.generate_content([prompt, audio_part])
                 bot_text = ai_response.text
                 
-                # Text Reply bhejo
                 resp.message(f"🗣️ {bot_text}")
                 
-                # Audio Reply Banao (TTS)
-                clean_text = clean_text_for_audio(bot_text)
-                tts = gTTS(text=clean_text, lang='hi') # Default Hindi accent (works well for Hinglish too)
+                # TTS
+                tts = gTTS(text=clean_text_for_audio(bot_text), lang='hi')
                 audio_fn = f"reply_{datetime.now().strftime('%H%M%S')}.mp3"
                 tts.save(str(AUDIO_DIR / audio_fn))
-                
-                # Audio Reply Bhejo
                 msg = resp.message("")
                 msg.media(f"{host_url}audios/{audio_fn}")
 
-        # === B. TEXT CHAT HANDLING ===
+        # === B. TEXT CHAT (With INTERNET) ===
         else:
-            # 1. NAME SAVING (Agar photo bheji thi)
-            if sender_id in pending_names:
-                if photos_collection is not None:
-                    name_to_save = msg_body
-                    description = pending_names[sender_id]
-                    
-                    # MongoDB mein Save karna
-                    photo_doc = {
-                        "user_id": sender_id,
-                        "description": description,
-                        "name_tag": name_to_save,
-                        "timestamp": datetime.now()
-                    }
-                    photos_collection.insert_one(photo_doc)
-                    
-                    del pending_names[sender_id]
-                    resp.message(f"✅ Done! Maine hamesha ke liye yaad kar liya ki ye **{name_to_save}** hai.")
-                else:
-                    resp.message("⚠️ Database disconnected. Main abhi naam save nahi kar sakta.")
+            # 1. NAME SAVING
+            if sender_id in pending_names and photos_collection is not None:
+                photo_doc = {
+                    "user_id": sender_id, 
+                    "description": pending_names[sender_id],
+                    "name_tag": msg_body, 
+                    "timestamp": datetime.now()
+                }
+                photos_collection.insert_one(photo_doc)
+                del pending_names[sender_id]
+                resp.message(f"✅ Saved memory: {msg_body}")
 
-            # 2. PDF Q&A (Agar PDF bheji thi)
+            # 2. PDF CONTEXT
             elif sender_id in pdf_context:
-                prompt = f"Context: {pdf_context[sender_id]}\nUser Question: {msg_body}\nAnswer based ONLY on the context."
+                prompt = f"Context: {pdf_context[sender_id]}\nUser: {msg_body}"
                 ai_response = model.generate_content(prompt)
                 resp.message(ai_response.text)
 
-            # 3. NORMAL CHAT + MEMORY RECALL
+            # 3. NORMAL CHAT + MEMORY + INTERNET 🌍
             else:
+                # Step 1: Check Database Memory
                 memory_text = ""
-                # Database se purani yaadein nikalo (Last 5 photos)
                 if photos_collection is not None:
-                    try:
-                        recent_photos = photos_collection.find({"user_id": sender_id}).sort("timestamp", -1).limit(5)
-                        memories = []
-                        for doc in recent_photos:
-                            memories.append(f"- Name: {doc['name_tag']}, Appearance: {doc['description']}")
-                        if memories:
-                            memory_text = "My Visual Memories:\n" + "\n".join(memories)
-                    except Exception as e:
-                        print(f"DB Read Error: {e}")
+                    recent = photos_collection.find({"user_id": sender_id}).sort("timestamp", -1).limit(3)
+                    mems = [f"{r['name_tag']} ({r['description']})" for r in recent]
+                    if mems: memory_text = "Memories: " + ", ".join(mems)
 
-                # AI ko context aur memory do
-                prompt = f"{memory_text}\nUser Message: {msg_body}\nINSTRUCTION: Reply smartly in the User's Language. If they ask 'Who is this?', use the Visual Memories."
+                # Step 2: Check for SEARCH Keywords
+                search_result = ""
+                # Agar user current info maange (news, weather, price, who is, latest)
+                triggers = ["news", "price", "weather", "score", "latest", "current", "who is", "what is", "search", "update"]
+                if any(word in msg_body.lower() for word in triggers):
+                    search_data = google_search(msg_body)
+                    if search_data:
+                        search_result = f"\nINTERNET DATA:\n{search_data}\n"
+
+                # Step 3: Final Prompt
+                prompt = f"""
+                {memory_text}
+                {search_result}
+                User Message: {msg_body}
+                INSTRUCTION: Reply naturally. If Internet Data is provided, use it to answer accurately.
+                """
                 ai_response = model.generate_content(prompt)
                 resp.message(ai_response.text)
 
     except Exception as e:
-        print(f"❌ Critical Error: {e}")
-        resp.message("System busy... Please try again in 5 seconds.")
+        print(f"Error: {e}")
+        resp.message("Bot is thinking...")
 
     return Response(content=str(resp), media_type="application/xml")
