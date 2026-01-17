@@ -25,8 +25,8 @@ if not GROQ_API_KEY:
 # Initialize Groq
 client = Groq(api_key=GROQ_API_KEY)
 
-# Models (Free & Fast)
-TEXT_MODEL = "llama3-70b-8192"
+# --- ⚠️ UPDATED MODELS (Working Now) ---
+TEXT_MODEL = "llama-3.3-70b-versatile"  # NEW STABLE MODEL
 VISION_MODEL = "llama-3.2-11b-vision-preview"
 AUDIO_MODEL = "whisper-large-v3"
 
@@ -126,7 +126,7 @@ async def whatsapp(request: Request):
                 # 1. Vision Analysis
                 desc = groq_vision("Describe this image in 1 sentence. Identify the main object.", m_data)
                 
-                # 2. Memory Check (FIXED HERE)
+                # 2. Memory Check
                 found_tag = None
                 if photos_collection is not None:
                     recent = photos_collection.find({"user_id": sender}).limit(20)
@@ -168,7 +168,6 @@ async def whatsapp(request: Request):
                 clean = groq_chat(f"Extract ONLY the name from: '{msg}'. If not a name, say 'Unknown'.").strip()
                 final_name = msg if "Unknown" in clean else clean
                 
-                # (FIXED HERE)
                 if photos_collection is not None:
                     photos_collection.insert_one({
                         "user_id": sender, "description": ctx['desc'], 
@@ -185,7 +184,6 @@ async def whatsapp(request: Request):
                     if s: web_info = f"Web Info: {s}"
                 
                 memories = ""
-                # (FIXED HERE)
                 if photos_collection is not None:
                     recent = photos_collection.find({"user_id": sender}).limit(3)
                     memories = ", ".join([r['name_tag'] for r in recent])
@@ -195,6 +193,6 @@ async def whatsapp(request: Request):
 
     except Exception as e:
         print(f"Error: {e}")
-        resp.message("⚠️ Bot sleeping.")
+        resp.message("⚠️ Server busy. Try again.")
 
     return Response(content=str(resp), media_type="application/xml")
