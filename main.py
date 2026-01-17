@@ -30,7 +30,7 @@ Traits: Truthful, Direct, and Multilingual (Reply in the same language as the us
 """
 
 genai.configure(api_key=API_KEY)
-# Using gemini-2.5-flash as per availability check
+# Using gemini-2.5-flash as per availability
 model = genai.GenerativeModel('gemini-2.5-flash', system_instruction=SYSTEM_PROMPT)
 
 app = FastAPI()
@@ -82,7 +82,8 @@ def check_memory_duplicate(user_id: str, current_desc: str) -> str:
     Checks if a similar object exists in the user's recent memory.
     Returns the Name Tag if found, else None.
     """
-    if not photos_collection:
+    # FIX: Explicitly check for None
+    if photos_collection is None:
         return None
         
     recent_items = photos_collection.find({"user_id": user_id}).sort("timestamp", -1).limit(20)
@@ -107,7 +108,6 @@ def check_memory_duplicate(user_id: str, current_desc: str) -> str:
 def extract_clean_name(user_text: str) -> str:
     """
     Extracts the specific entity name from a conversational sentence.
-    E.g., "Please save as Moti" -> "Moti"
     """
     prompt = f"""
     Extract ONLY the name tag from this user request: "{user_text}"
@@ -182,7 +182,7 @@ async def handle_whatsapp(request: Request):
                 reply_text = audio_res.text
 
                 # Generate TTS
-                tts = gTTS(text=reply_text.replace('*', ''), lang='hi') # 'hi' auto-detects well for mixed Indian context
+                tts = gTTS(text=reply_text.replace('*', ''), lang='hi') 
                 audio_filename = f"reply_{datetime.now().strftime('%H%M%S')}.mp3"
                 tts.save(str(AUDIO_DIR / audio_filename))
                 
@@ -216,7 +216,8 @@ async def handle_whatsapp(request: Request):
             else:
                 # Fetch recent memories for context
                 mem_str = ""
-                if photos_collection:
+                # FIX: Explicit check for None
+                if photos_collection is not None:
                     recent = photos_collection.find({"user_id": sender_id}).sort("timestamp", -1).limit(3)
                     mem_str = ", ".join([f"{r['name_tag']} ({r['description']})" for r in recent])
 
