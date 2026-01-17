@@ -1,38 +1,32 @@
 import os
+import base64
 import requests
-import google.generativeai as genai
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 from twilio.twiml.messaging_response import MessagingResponse
-from gtts import gTTS
 from pypdf import PdfReader
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from duckduckgo_search import DDGS
+from groq import Groq
 
 # --- Configuration ---
 load_dotenv()
-API_KEY = os.getenv("GOOGLE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 
-if not API_KEY:
-    raise ValueError("GOOGLE_API_KEY is missing in environment variables.")
+if not GROQ_API_KEY:
+    print("⚠️ WARNING: GROQ_API_KEY missing.")
 
-# --- IDENTITY ---
-SYSTEM_PROMPT = """
-You are ThirdEye, an intelligent AI Assistant created by Rakesh Raushan.
-Your core function is to assist with visual memory, daily tasks, and information retrieval.
-Traits: Truthful, Direct, and Multilingual (Reply in the same language as the user).
-"""
+# Initialize Groq
+client = Groq(api_key=GROQ_API_KEY)
 
-genai.configure(api_key=API_KEY)
-
-# ⚠️ CRITICAL FIX: Switched to 1.5-flash for higher rate limits (1500 req/day)
-# 2.5-flash has a limit of 20/day which caused your 429 error.
-model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=SYSTEM_PROMPT)
+# Models (Free & Fast)
+TEXT_MODEL = "llama3-70b-8192"
+VISION_MODEL = "llama-3.2-11b-vision-preview"
 
 app = FastAPI()
 
@@ -40,8 +34,8 @@ app = FastAPI()
 photos_collection = None
 if MONGO_URI:
     try:
-        client = MongoClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=True)
-        db = client.thirdeye_db
+        mongo_client = MongoClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=True)
+        db = mongo_client.thirdeye_db
         photos_collection = db.photos
         print("INFO: Connected to MongoDB Atlas.")
     except Exception as e:
@@ -49,12 +43,8 @@ if MONGO_URI:
 
 # --- Storage ---
 BASE_DIR = Path("/tmp")
-AUDIO_DIR = BASE_DIR / "audios"
 DOCS_DIR = BASE_DIR / "documents"
-for folder in [AUDIO_DIR, DOCS_DIR]:
-    folder.mkdir(parents=True, exist_ok=True)
-
-app.mount("/audios", StaticFiles(directory=str(AUDIO_DIR)), name="audios")
+DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- State ---
 pending_image_context = {}
@@ -68,143 +58,113 @@ def search_internet(query: str) -> str:
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=3))
-            if results:
-                return "\n".join([f"- {r['body']}" for r in results])
-    except Exception as e:
-        print(f"Search failed: {e}")
-    return None
+            if results: return "\n".join([f"- {r['body']}" for r in results])
+    except: return None
 
-def check_memory_duplicate(user_id: str, current_desc: str) -> str:
-    if photos_collection is None:
-        return None
-        
-    recent_items = photos_collection.find({"user_id": user_id}).sort("timestamp", -1).limit(20)
-    
-    for item in recent_items:
-        prompt = f"""
-        Compare these two object descriptions:
-        1. New Image: "{current_desc}"
-        2. Saved Memory: "{item['description']}"
-        
-        Are they referring to the EXACT SAME object? Answer ONLY 'YES' or 'NO'.
-        """
-        try:
-            res = model.generate_content(prompt)
-            if "YES" in res.text.strip().upper():
-                return item['name_tag']
-        except:
-            continue
-    return None
-
-def extract_clean_name(user_text: str) -> str:
-    prompt = f"""
-    Extract ONLY the name tag from this user request: "{user_text}"
-    Rules:
-    - If user says "Save as Moti", return "Moti".
-    - If user asks a question like "Did you save this?", return "Unknown".
-    - Remove conversational filler.
-    - Return strictly the name string.
-    """
+def groq_chat(prompt: str, system_msg: str = "You are ThirdEye AI.") -> str:
     try:
-        res = model.generate_content(prompt)
-        cleaned = res.text.strip()
-        if "Unknown" in cleaned:
-            return user_text # Fallback
-        return cleaned
-    except:
-        return user_text
+        return client.chat.completions.create(
+            messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
+            model=TEXT_MODEL,
+        ).choices[0].message.content
+    except Exception as e: return f"Error: {e}"
+
+def groq_vision(prompt: str, image_bytes: bytes) -> str:
+    try:
+        b64_img = base64.b64encode(image_bytes).decode('utf-8')
+        return client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                ]
+            }]
+        ).choices[0].message.content
+    except Exception as e: return f"Error: {e}"
 
 # --- Routes ---
 @app.head("/")
-async def health_check():
-    return Response(status_code=200)
+async def health(): return Response(status_code=200)
 
 @app.post("/whatsapp")
-async def handle_whatsapp(request: Request):
+async def whatsapp(request: Request):
     form = await request.form()
     num_media = int(form.get('NumMedia', 0))
-    msg_body = form.get('Body', '').strip()
-    sender_id = form.get('From')
-    host_url = str(request.base_url).replace("http://", "https://")
+    msg = form.get('Body', '').strip()
+    sender = form.get('From')
     resp = MessagingResponse()
 
     try:
         # === MEDIA ===
         if num_media > 0:
-            media_type = form.get('MediaContentType0')
-            media_url = form.get('MediaUrl0')
-            media_data = fetch_media_bytes(media_url)
+            m_type = form.get('MediaContentType0')
+            m_url = form.get('MediaUrl0')
+            m_data = fetch_media_bytes(m_url)
 
-            if 'image' in media_type:
+            if 'image' in m_type:
                 # 1. Vision Analysis
-                prompt = "Describe this image in detail. Identify the main object clearly."
-                vision_res = model.generate_content([prompt, {"mime_type": media_type, "data": media_data}])
-                description = vision_res.text.strip()
-
+                desc = groq_vision("Describe this image in 1 sentence. Identify the main object.", m_data)
+                
                 # 2. Memory Check
-                existing_tag = check_memory_duplicate(sender_id, description)
-
-                if existing_tag:
-                    resp.message(f"🧠 *Memory Recall:* I recognize this! It's '{existing_tag}'.")
+                found_tag = None
+                if photos_collection:
+                    recent = photos_collection.find({"user_id": sender}).limit(20)
+                    for item in recent:
+                        check = groq_chat(f"Compare:\n1. '{desc}'\n2. '{item['description']}'\nSame object? YES/NO ONLY.")
+                        if "YES" in check.upper():
+                            found_tag = item['name_tag']
+                            break
+                
+                if found_tag:
+                    resp.message(f"🧠 *Recall:* That's '{found_tag}'!")
                 else:
-                    pending_image_context[sender_id] = {"desc": description}
-                    resp.message(f"👁️ *Analysis:* {description}\n\nThis seems new. Reply with a *Name* to save it.")
+                    pending_image_context[sender] = {"desc": desc}
+                    resp.message(f"👁️ *Analysis:* {desc}\n\nReply with a *Name* to save this.")
 
-            elif 'application/pdf' in media_type:
-                pdf_path = DOCS_DIR / f"doc_{sender_id[-4:]}.pdf"
-                with open(pdf_path, "wb") as f: f.write(media_data)
-                reader = PdfReader(pdf_path)
-                pdf_context[sender_id] = "\n".join([p.extract_text() for p in reader.pages])
-                resp.message(f"✅ PDF Processed ({len(reader.pages)} pages). Ask me questions.")
-
-            elif 'audio' in media_type:
-                audio_res = model.generate_content(["Listen and reply in the exact same language.", {"mime_type": media_type, "data": media_data}])
-                reply_text = audio_res.text
-                tts = gTTS(text=reply_text.replace('*', ''), lang='hi') 
-                fn = f"reply_{datetime.now().strftime('%H%M%S')}.mp3"
-                tts.save(str(AUDIO_DIR / fn))
-                resp.message(f"🗣️ {reply_text}")
-                resp.message("").media(f"{host_url}audios/{fn}")
+            elif 'application/pdf' in m_type:
+                path = DOCS_DIR / f"doc_{sender[-4:]}.pdf"
+                with open(path, "wb") as f: f.write(m_data)
+                reader = PdfReader(path)
+                pdf_context[sender] = "\n".join([p.extract_text() for p in reader.pages])
+                resp.message(f"✅ PDF Loaded. Ask questions.")
 
         # === TEXT ===
         else:
-            # 1. Saving a Name
-            if sender_id in pending_image_context and photos_collection is not None:
-                ctx = pending_image_context[sender_id]
-                clean_name = extract_clean_name(msg_body)
+            # 1. Save Name
+            if sender in pending_image_context:
+                ctx = pending_image_context[sender]
+                # Clean name logic
+                clean = groq_chat(f"Extract ONLY the name from: '{msg}'. If not a name, say 'Unknown'.").strip()
+                final_name = msg if "Unknown" in clean else clean
                 
-                doc = {
-                    "user_id": sender_id, 
-                    "description": ctx['desc'], 
-                    "name_tag": clean_name, 
-                    "timestamp": datetime.now()
-                }
-                photos_collection.insert_one(doc)
-                del pending_image_context[sender_id]
-                resp.message(f"✅ Memory Saved: Tagged as '{clean_name}'.")
-
-            # 2. PDF Context
-            elif sender_id in pdf_context:
-                resp.message(model.generate_content(f"Context: {pdf_context[sender_id]}\nUser: {msg_body}").text)
-
-            # 3. Chat & Search
-            else:
-                web_data = ""
-                if any(x in msg_body.lower() for x in ["price", "news", "weather", "who is"]) or "?" in msg_body:
-                    res = search_internet(msg_body)
-                    if res: web_data = f"Internet Info:\n{res}"
-
-                # Fetch Memories
-                mem_str = ""
                 if photos_collection is not None:
-                    recent = photos_collection.find({"user_id": sender_id}).sort("timestamp", -1).limit(3)
-                    mem_str = ", ".join([f"{r['name_tag']} ({r['description']})" for r in recent])
+                    photos_collection.insert_one({
+                        "user_id": sender, "description": ctx['desc'], 
+                        "name_tag": final_name, "timestamp": datetime.now()
+                    })
+                del pending_image_context[sender]
+                resp.message(f"✅ Saved as '{final_name}'.")
 
-                final_prompt = f"Memories: {mem_str}\nWeb Info: {web_data}\nUser: {msg_body}\nAnswer naturally."
-                resp.message(model.generate_content(final_prompt).text)
+            # 2. Chat
+            else:
+                web_info = ""
+                if "?" in msg:
+                    s = search_internet(msg)
+                    if s: web_info = f"Web Info: {s}"
+                
+                # Fetch Memories
+                memories = ""
+                if photos_collection:
+                    recent = photos_collection.find({"user_id": sender}).limit(3)
+                    memories = ", ".join([r['name_tag'] for r in recent])
+
+                ans = groq_chat(f"Memories: {memories}\nWeb: {web_info}\nUser: {msg}")
+                resp.message(ans)
 
     except Exception as e:
-        print(f"ERROR: {e}")
-        resp.message("⚠️ Server busy (Quota/Network). Please try again in a moment.")
+        print(f"Error: {e}")
+        resp.message("⚠️ Bot sleeping.")
 
     return Response(content=str(resp), media_type="application/xml")
