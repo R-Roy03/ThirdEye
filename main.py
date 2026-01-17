@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 from twilio.twiml.messaging_response import MessagingResponse
+from gtts import gTTS
 from pypdf import PdfReader
 from dotenv import load_dotenv
 from pymongo import MongoClient
@@ -27,6 +28,7 @@ client = Groq(api_key=GROQ_API_KEY)
 # Models (Free & Fast)
 TEXT_MODEL = "llama3-70b-8192"
 VISION_MODEL = "llama-3.2-11b-vision-preview"
+AUDIO_MODEL = "whisper-large-v3"
 
 app = FastAPI()
 
@@ -43,8 +45,12 @@ if MONGO_URI:
 
 # --- Storage ---
 BASE_DIR = Path("/tmp")
+AUDIO_DIR = BASE_DIR / "audios"
 DOCS_DIR = BASE_DIR / "documents"
-DOCS_DIR.mkdir(parents=True, exist_ok=True)
+for folder in [AUDIO_DIR, DOCS_DIR]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+app.mount("/audios", StaticFiles(directory=str(AUDIO_DIR)), name="audios")
 
 # --- State ---
 pending_image_context = {}
@@ -61,7 +67,7 @@ def search_internet(query: str) -> str:
             if results: return "\n".join([f"- {r['body']}" for r in results])
     except: return None
 
-def groq_chat(prompt: str, system_msg: str = "You are ThirdEye AI.") -> str:
+def groq_chat(prompt: str, system_msg: str = "You are ThirdEye AI. Reply in the same language as the user.") -> str:
     try:
         return client.chat.completions.create(
             messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
@@ -84,6 +90,18 @@ def groq_vision(prompt: str, image_bytes: bytes) -> str:
         ).choices[0].message.content
     except Exception as e: return f"Error: {e}"
 
+def groq_transcribe(audio_bytes: bytes) -> str:
+    try:
+        temp_path = AUDIO_DIR / "temp_input.mp3"
+        with open(temp_path, "wb") as f: f.write(audio_bytes)
+        with open(temp_path, "rb") as file:
+            return client.audio.transcriptions.create(
+                file=(str(temp_path), file.read()),
+                model=AUDIO_MODEL,
+                response_format="text"
+            )
+    except Exception as e: return f"Error: {e}"
+
 # --- Routes ---
 @app.head("/")
 async def health(): return Response(status_code=200)
@@ -94,6 +112,7 @@ async def whatsapp(request: Request):
     num_media = int(form.get('NumMedia', 0))
     msg = form.get('Body', '').strip()
     sender = form.get('From')
+    host_url = str(request.base_url).replace("http://", "https://")
     resp = MessagingResponse()
 
     try:
@@ -107,9 +126,9 @@ async def whatsapp(request: Request):
                 # 1. Vision Analysis
                 desc = groq_vision("Describe this image in 1 sentence. Identify the main object.", m_data)
                 
-                # 2. Memory Check
+                # 2. Memory Check (FIXED HERE)
                 found_tag = None
-                if photos_collection:
+                if photos_collection is not None:
                     recent = photos_collection.find({"user_id": sender}).limit(20)
                     for item in recent:
                         check = groq_chat(f"Compare:\n1. '{desc}'\n2. '{item['description']}'\nSame object? YES/NO ONLY.")
@@ -130,15 +149,26 @@ async def whatsapp(request: Request):
                 pdf_context[sender] = "\n".join([p.extract_text() for p in reader.pages])
                 resp.message(f"✅ PDF Loaded. Ask questions.")
 
+            elif 'audio' in m_type:
+                user_text = groq_transcribe(m_data)
+                ai_reply = groq_chat(f"User said: {user_text}. Reply naturally in the same language.")
+                
+                tts = gTTS(text=ai_reply.replace('*', ''), lang='hi')
+                fn = f"reply_{datetime.now().strftime('%H%M%S')}.mp3"
+                tts.save(str(AUDIO_DIR / fn))
+                
+                resp.message(f"🗣️ {ai_reply}")
+                resp.message("").media(f"{host_url}audios/{fn}")
+
         # === TEXT ===
         else:
             # 1. Save Name
             if sender in pending_image_context:
                 ctx = pending_image_context[sender]
-                # Clean name logic
                 clean = groq_chat(f"Extract ONLY the name from: '{msg}'. If not a name, say 'Unknown'.").strip()
                 final_name = msg if "Unknown" in clean else clean
                 
+                # (FIXED HERE)
                 if photos_collection is not None:
                     photos_collection.insert_one({
                         "user_id": sender, "description": ctx['desc'], 
@@ -154,9 +184,9 @@ async def whatsapp(request: Request):
                     s = search_internet(msg)
                     if s: web_info = f"Web Info: {s}"
                 
-                # Fetch Memories
                 memories = ""
-                if photos_collection:
+                # (FIXED HERE)
+                if photos_collection is not None:
                     recent = photos_collection.find({"user_id": sender}).limit(3)
                     memories = ", ".join([r['name_tag'] for r in recent])
 
