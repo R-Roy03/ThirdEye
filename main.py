@@ -44,7 +44,7 @@ INTERACTION:
 
 genai.configure(api_key=API_KEY)
 # Hum 'gemini-2.0-flash' use karenge jo aapki list mein hai
-model = genai.GenerativeModel('gemini-2.0-flash', system_instruction=SYSTEM_PROMPT)
+model = genai.GenerativeModel('gemini-2.5-flash', system_instruction=SYSTEM_PROMPT)
 
 app = FastAPI()
 
